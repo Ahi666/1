@@ -1,0 +1,777 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import psycopg2
+import os
+from PIL import Image, ImageTk
+
+# НАСТРОЙКИ
+DB_CONFIG = {
+    "host": "localhost",
+    "dbname": "postgres",
+    "user": "postgres",
+    "password": "1111",
+    "port": "5432"
+}
+SCHEMA = "prac"
+TABLES = {
+    "users": f"{SCHEMA}.users",
+    "roles": f"{SCHEMA}.roles",
+    "bicycles": f"{SCHEMA}.bicycles",
+    "orders": f"{SCHEMA}.orders",
+    "comp": f"{SCHEMA}.ordercomposition",
+    "pickup": f"{SCHEMA}.pickuppoints"
+}
+COLORS = {
+    "bg": "#FFFFFF",
+    "sec": "#7FFF00",
+    "acc": "#00FA9A",
+    "disc": "#2E8B57",
+    "nostock": "#87CEEB",
+    "sel": "#FFD700"
+}
+
+class BikeShopApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ВелоМагазин")
+        self.root.geometry("1100x750")
+        self.root.configure(bg=COLORS["bg"])
+        self.conn = self.cur = None
+        self.user = {"name": "", "role": ""}
+        self.app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.edit_win = self.order_edit_win = self.pickup_edit_win = None
+        self.status_lbl = None
+        self.content = None
+        self._connect()
+        if self.conn:
+            self._show_login()
+
+    def _connect(self):
+        try:
+            self.conn = psycopg2.connect(**DB_CONFIG)
+            self.cur = self.conn.cursor()
+        except Exception as e:
+            messagebox.showerror("БД", f"Ошибка подключения: {e}")
+            self.root.destroy()
+
+    #ЭКРАН ВХОДА
+    def _show_login(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        frm = tk.Frame(self.root, bg=COLORS["sec"], padx=40, pady=30)
+        frm.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(frm, text="ВЕЛОМАГАЗИН — ВХОД", font=("Times New Roman", 16, "bold"),
+                 bg=COLORS["sec"]).pack(pady=10)
+        for t, s in [("Логин:", ""), ("Пароль:", "*")]:
+            tk.Label(frm, text=t, font=("Times New Roman", 12), bg=COLORS["sec"]).pack(anchor="w")
+            ent = tk.Entry(frm, font=("Times New Roman", 12), width=25, show=s)
+            ent.pack(pady=5, fill="x")
+            if "Логин" in t:
+                self.ent_l = ent
+            else:
+                self.ent_p = ent
+        b = tk.Frame(frm, bg=COLORS["sec"])
+        b.pack(fill="x", pady=15)
+        tk.Button(b, text="Войти", bg=COLORS["acc"], command=self._login).pack(side="left", expand=True, padx=5)
+        tk.Button(b, text="Гость", bg=COLORS["acc"], command=lambda: self._set_user("Гость", "Гость")).pack(side="left", expand=True, padx=5)
+
+    def _login(self):
+        l, p = self.ent_l.get().strip(), self.ent_p.get().strip()
+        if not (l and p):
+            messagebox.showwarning("Ввод", "Заполните поля")
+            return
+        try:
+            self.cur.execute(
+                f"SELECT fullname, rolename FROM {TABLES['users']} u "
+                f"JOIN {TABLES['roles']} r ON u.roleid=r.roleid "
+                f"WHERE login=%s AND password=%s", (l, p))
+            res = self.cur.fetchone()
+            if res:
+                self._set_user(res[0], res[1])
+            else:
+                messagebox.showerror("Ошибка", "Неверный логин/пароль")
+        except Exception as e:
+            messagebox.showerror("БД", str(e))
+
+    def _set_user(self, name, role):
+        self.user = {"name": name, "role": role}
+        self._show_main()
+
+    #ГЛАВНОЕ ОКНО
+    def _show_main(self):
+        for w in self.root.winfo_children():
+            w.destroy()
+        self.root.title(f"ВелоМагазин | {self.user['name']} ({self.user['role']})")
+
+        #Верхняя панель
+        top = tk.Frame(self.root, bg=COLORS["sec"], height=50)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        tk.Label(top, text="СИСТЕМА УПРАВЛЕНИЯ", font=("Times New Roman", 14, "bold"),
+                 bg=COLORS["sec"]).pack(side="left", padx=10)
+        self.status_lbl = tk.Label(top, text="Готов к работе", font=("Times New Roman", 11),
+                                   bg=COLORS["sec"], fg="black")
+        self.status_lbl.pack(side="right", padx=10)
+        tk.Label(top, text=f"{self.user['name']} | {self.user['role']}",
+                 font=("Times New Roman", 12), bg=COLORS["sec"]).pack(side="right", padx=10)
+        tk.Button(top, text="Выход", bg=COLORS["acc"], command=self._show_login).pack(side="right", padx=10)
+
+        # Боковое меню (меняется в зависимости от роли)
+        side = tk.Frame(self.root, bg=COLORS["sec"], width=200)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+
+        self.content = tk.Frame(self.root, bg=COLORS["bg"])
+        self.content.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+
+        #Формирование кнопок меню
+        buttons = [("Товары", self._show_products)]
+        if self.user["role"] == "Менеджер":
+            buttons.append(("Заказы", self._show_orders))
+        elif self.user["role"] == "Администратор":
+            buttons.append(("Заказы", self._show_orders))
+            buttons.append(("Пункты выдачи", self._show_pickup))
+            buttons.append(("Аналитика", self._show_analytics))
+
+        for txt, cmd in buttons:
+            tk.Button(side, text=txt, font=("Times New Roman", 11),
+                      bg=COLORS["acc"], pady=8, command=cmd).pack(fill="x", padx=5, pady=3)
+        self._show_products()
+
+    #ТОВАРЫ
+    def _show_products(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+        #Панель поиска/фильтров
+        if self.user["role"] in ["Менеджер", "Администратор"]:
+            top_panel = tk.Frame(self.content, bg=COLORS["bg"])
+            top_panel.pack(fill="x", pady=5)
+
+            search_frame = tk.Frame(top_panel, bg=COLORS["bg"])
+            search_frame.pack(side="left", padx=5)
+            tk.Label(search_frame, text="Поиск:", font=("Times New Roman", 11),
+                     bg=COLORS["bg"]).pack(side="left")
+            self.search_ent = tk.Entry(search_frame, font=("Times New Roman", 11), width=20)
+            self.search_ent.pack(side="left", padx=5)
+            self.search_ent.bind("<KeyRelease>", lambda e: self._load_cards())
+
+            tk.Label(search_frame, text="Сорт:", font=("Times New Roman", 11),
+                     bg=COLORS["bg"]).pack(side="left", padx=(10, 5))
+            self.sort_var = tk.StringVar(value="По умолчанию")
+            sort_cb = ttk.Combobox(search_frame, textvariable=self.sort_var,
+                                   values=["По умолчанию", "Остаток ↑", "Остаток ↓"],
+                                   font=("Times New Roman", 11), width=12, state="readonly")
+            sort_cb.pack(side="left", padx=5)
+            self.sort_var.trace_add("write", lambda *a: self._load_cards())
+
+            tk.Label(search_frame, text="Поставщик:", font=("Times New Roman", 11),
+                     bg=COLORS["bg"]).pack(side="left", padx=(10, 5))
+            self.sup_var = tk.StringVar(value="Все поставщики")
+            sup_cb = ttk.Combobox(search_frame, textvariable=self.sup_var,
+                                  font=("Times New Roman", 11), width=15)
+            sup_cb.pack(side="left", padx=5)
+            sup_cb.bind("<<ComboboxSelected>>", lambda e: self._load_cards())
+            try:
+                self.cur.execute(
+                    f"SELECT DISTINCT supplier FROM {TABLES['bicycles']} "
+                    f"WHERE supplier IS NOT NULL ORDER BY supplier")
+                sup_cb["values"] = ["Все поставщики"] + [r[0] for r in self.cur.fetchall()]
+                sup_cb.current(0)
+            except:
+                pass
+
+            #Кнопка добавления
+            if self.user["role"] == "Администратор":
+                tk.Button(top_panel, text="➕ Добавить велосипед", bg=COLORS["acc"],
+                          command=self._open_product_form).pack(side="right", padx=5)
+
+        #Холст с прокруткой
+        canvas = tk.Canvas(self.content, bg=COLORS["bg"], highlightthickness=0)
+        scr = ttk.Scrollbar(self.content, orient="vertical", command=canvas.yview)
+        self.card_frm = tk.Frame(canvas, bg=COLORS["bg"])
+        self.card_frm.bind("<Configure>",
+                           lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.card_frm, anchor="nw")
+        canvas.configure(yscrollcommand=scr.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+        self._load_cards()
+
+    def _load_cards(self):
+        for w in self.card_frm.winfo_children():
+            w.destroy()
+        try:
+            q = (f"SELECT sku, productname, category, description, manufacturer, "
+                 f"supplier, price, unit, stockquantity, currentdiscount, photo "
+                 f"FROM {TABLES['bicycles']}")
+            params = []
+            #Фильтрация и сортировка
+            if self.user["role"] in ["Менеджер", "Администратор"]:
+                search = self.search_ent.get().strip()
+                sup = self.sup_var.get()
+                filters = []
+                if search:
+                    filters.append(
+                        "(productname ILIKE %s OR category ILIKE %s OR "
+                        "manufacturer ILIKE %s OR supplier ILIKE %s)")
+                    params += [f"%{search}%"] * 4
+                if sup != "Все поставщики":
+                    filters.append("supplier = %s")
+                    params.append(sup)
+                if filters:
+                    q += " WHERE " + " AND ".join(filters)
+                sort = self.sort_var.get()
+                if sort == "Остаток ↑":
+                    q += " ORDER BY stockquantity ASC"
+                elif sort == "Остаток ↓":
+                    q += " ORDER BY stockquantity DESC"
+            self.cur.execute(q, params)
+            for row in self.cur.fetchall():
+                self._make_card(row)
+        except Exception as e:
+            messagebox.showerror("БД", str(e))
+
+    def _make_card(self, data):
+        sku, name, cat, desc, manuf, sup, price, unit, stock, disc, photo = data
+        price, disc, stock = float(price or 0), int(disc or 0), int(stock or 0)
+        bg = (COLORS["disc"] if disc > 15
+              else COLORS["nostock"] if stock == 0
+              else COLORS["bg"])
+        frm = tk.Frame(self.card_frm, bg=bg, relief="solid", bd=1, padx=10, pady=10)
+        frm.pack(fill="x", padx=5, pady=5)
+
+        #Изображение
+        img_frm = tk.Frame(frm, bg="white", width=120, height=120)
+        img_frm.pack(side="left", padx=5)
+        img_frm.pack_propagate(False)
+        try:
+            if photo and os.path.exists(os.path.join(self.app_dir, photo)):
+                img = Image.open(os.path.join(self.app_dir, photo)).resize(
+                    (110, 110), Image.Resampling.LANCZOS)
+                ph = ImageTk.PhotoImage(img)
+                tk.Label(img_frm, image=ph, bg="white").pack(expand=True)
+                img_frm.image = ph
+            else:
+                raise
+        except:
+            tk.Label(img_frm, text="Нет фото", font=("Times New Roman", 10),
+                     bg="white").pack(expand=True)
+
+        #Информация
+        info = tk.Frame(frm, bg=bg)
+        info.pack(side="left", fill="both", expand=True, padx=10)
+        tk.Label(info, text=name, font=("Times New Roman", 13, "bold"),
+                 bg=bg, anchor="w").pack(fill="x")
+        tk.Label(info, text=f"{cat} | {manuf} | {sup}",
+                 font=("Times New Roman", 11), bg=bg, anchor="w").pack(fill="x")
+        if desc:
+            tk.Label(info, text=desc, font=("Times New Roman", 10),
+                     bg=bg, wraplength=500, justify="left").pack(fill="x", pady=2)
+        pf = tk.Frame(info, bg=bg)
+        pf.pack(fill="x", pady=5)
+        if disc > 0:
+            tk.Label(pf, text=f"{price:.0f}₽",
+                     font=("Times New Roman", 11, "overstrike"),
+                     fg="red", bg=bg).pack(side="left", padx=5)
+            tk.Label(pf, text=f"{price*(1-disc/100):.0f}₽",
+                     font=("Times New Roman", 13, "bold"), bg=bg).pack(side="left", padx=5)
+            tk.Label(pf, text=f"(-{disc}%)",
+                     font=("Times New Roman", 10), bg=bg).pack(side="left", padx=5)
+        else:
+            tk.Label(pf, text=f"{price:.0f}₽",
+                     font=("Times New Roman", 13, "bold"), bg=bg).pack(side="left", padx=5)
+        tk.Label(info, text=f"Остаток: {stock} {unit}",
+                 font=("Times New Roman", 11), bg=bg).pack(anchor="w")
+
+        #Кнопки админа на карточке
+        if self.user["role"] == "Администратор":
+            btn_frm = tk.Frame(frm, bg=bg)
+            btn_frm.pack(side="right", padx=5)
+            tk.Button(btn_frm, text="ред.", bg=COLORS["acc"],
+                      command=lambda: self._open_product_form(sku)).pack(side="top", pady=2)
+            tk.Button(btn_frm, text="уд.", bg="#FF6B6B",
+                      command=lambda: self._delete_product(sku)).pack(side="top", pady=2)
+
+    def _delete_product(self, sku):
+        if messagebox.askyesno("Удаление", f"Удалить велосипед {sku}?"):
+            try:
+                self.cur.execute(
+                    f"SELECT COUNT(*) FROM {TABLES['comp']} WHERE sku=%s", (sku,))
+                if self.cur.fetchone()[0] > 0:
+                    messagebox.showwarning("Запрет", "Товар есть в заказе.")
+                    return
+                self.cur.execute(
+                    f"DELETE FROM {TABLES['bicycles']} WHERE sku=%s", (sku,))
+                self.conn.commit()
+                self._load_cards()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("БД", str(e))
+
+    def _open_product_form(self, sku=None):
+        if self.edit_win is not None:
+            try:
+                if self.edit_win.winfo_exists():
+                    messagebox.showwarning("Окно", "Закройте открытое окно")
+                    return
+            except:
+                pass
+        self.edit_win = tk.Toplevel(self.root)
+        self.edit_win.title("Редактирование" if sku else "Добавление велосипеда")
+        self.edit_win.geometry("400x520")
+        self.edit_win.configure(bg=COLORS["sec"])
+        self.edit_win.transient(self.root)
+        self.edit_win.grab_set()
+
+        fields = [
+            ("Название:", "name"),
+            ("Категория:", "cat"),
+            ("Описание:", "desc"),
+            ("Производитель:", "manuf"),
+            ("Поставщик:", "sup"),
+            ("Цена:", "price"),
+            ("Остаток:", "stock"),
+            ("Скидка %:", "disc"),
+            ("Фото:", "photo")
+        ]
+        ents = {}
+        for i, (lbl, key) in enumerate(fields):
+            tk.Label(self.edit_win, text=lbl, font=("Times New Roman", 12),
+                     bg=COLORS["sec"]).grid(row=i, column=0, sticky="w", padx=10, pady=5)
+            ents[key] = tk.Entry(self.edit_win, font=("Times New Roman", 12), width=30)
+            ents[key].grid(row=i, column=1, padx=10, pady=5, sticky="ew")
+            if key == "photo":
+                tk.Button(self.edit_win, text="файл", bg=COLORS["acc"],
+                          command=lambda e=ents["photo"]: e.insert(0,
+                              filedialog.askopenfilename(filetypes=[("Img", "*.png *.jpg")]))
+                          ).grid(row=i, column=2, padx=5)
+
+        if sku:
+            self.cur.execute(
+                f"SELECT productname, category, description, manufacturer, supplier, "
+                f"price, stockquantity, currentdiscount, photo "
+                f"FROM {TABLES['bicycles']} WHERE sku=%s", (sku,))
+            data = self.cur.fetchone()
+            for k, val in zip(["name", "cat", "desc", "manuf", "sup",
+                               "price", "stock", "disc", "photo"], data):
+                if val is not None:
+                    ents[k].insert(0, str(val))
+
+        def save():
+            try:
+                v = {k: e.get().strip() for k, e in ents.items()}
+                if not v["name"]:
+                    raise ValueError("Название обязательно")
+                price_val = float(v["price"] or 0)
+                stock_val = int(v["stock"] or 0)
+                disc_val = int(v["disc"] or 0)
+                if price_val < 0 or stock_val < 0:
+                    raise ValueError("Цена и остаток ≥ 0")
+                if not (0 <= disc_val <= 100):
+                    raise ValueError("Скидка от 0 до 100")
+
+                photo_path = None
+                if v["photo"] and os.path.exists(v["photo"]):
+                    img = Image.open(v["photo"]).convert("RGB").resize(
+                        (300, 200), Image.Resampling.LANCZOS)
+                    fname = f"{sku or 'new'}_{os.path.basename(v['photo'])}"
+                    dest = os.path.join(self.app_dir, fname)
+                    img.save(dest)
+                    if sku:
+                        self.cur.execute(
+                            f"SELECT photo FROM {TABLES['bicycles']} WHERE sku=%s", (sku,))
+                        old_photo = self.cur.fetchone()[0]
+                        if old_photo and os.path.exists(os.path.join(self.app_dir, old_photo)):
+                            os.remove(os.path.join(self.app_dir, old_photo))
+                    photo_path = fname
+
+                if sku:
+                    self.cur.execute(
+                        f"UPDATE {TABLES['bicycles']} SET "
+                        f"productname=%s, category=%s, description=%s, "
+                        f"manufacturer=%s, supplier=%s, price=%s, "
+                        f"stockquantity=%s, currentdiscount=%s, photo=%s "
+                        f"WHERE sku=%s",
+                        (v["name"], v["cat"], v["desc"], v["manuf"], v["sup"],
+                         price_val, stock_val, disc_val, photo_path, sku))
+                else:
+                    self.cur.execute(
+                        f"SELECT COALESCE(MAX(CAST(sku AS INT)), 0)+1 "
+                        f"FROM {TABLES['bicycles']}")
+                    new_sku = str(self.cur.fetchone()[0]).zfill(3)
+                    self.cur.execute(
+                        f"INSERT INTO {TABLES['bicycles']} "
+                        f"(sku, productname, category, description, manufacturer, "
+                        f"supplier, price, stockquantity, currentdiscount, photo) "
+                        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (new_sku, v["name"], v["cat"], v["desc"], v["manuf"], v["sup"],
+                         price_val, stock_val, disc_val, photo_path))
+                self.conn.commit()
+                self.edit_win.destroy()
+                self.edit_win = None
+                self._load_cards()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", str(e))
+
+        tk.Button(self.edit_win, text="Сохранить", bg=COLORS["acc"],
+                  command=save).grid(row=len(fields), column=0, columnspan=3, pady=15)
+        self.edit_win.protocol("WM_DELETE_WINDOW", self._close_product_form)
+
+    def _close_product_form(self):
+        if self.edit_win and self.edit_win.winfo_exists():
+            self.edit_win.destroy()
+            self.edit_win = None
+
+    #ЗАКАЗЫ
+    def _show_orders(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+        if self.user["role"] == "Администратор":
+            tk.Button(self.content, text="➕ Добавить заказ", bg=COLORS["acc"],
+                      command=self._open_order_form).pack(anchor="w", padx=5, pady=5)
+
+        canvas = tk.Canvas(self.content, bg=COLORS["bg"], highlightthickness=0)
+        scr = ttk.Scrollbar(self.content, orient="vertical", command=canvas.yview)
+        self.order_frm = tk.Frame(canvas, bg=COLORS["bg"])
+        self.order_frm.bind("<Configure>",
+                            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.order_frm, anchor="nw")
+        canvas.configure(yscrollcommand=scr.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+        self._load_orders()
+
+    def _load_orders(self):
+        for w in self.order_frm.winfo_children():
+            w.destroy()
+        try:
+            self.cur.execute(
+                f"SELECT o.orderid, o.orderdate, o.deliverydate, p.address, "
+                f"o.clientfullname, o.receivecode, o.orderstatus "
+                f"FROM {TABLES['orders']} o "
+                f"LEFT JOIN {TABLES['pickup']} p ON o.pickuppointid = p.pointid "
+                f"ORDER BY o.orderdate DESC")
+            for row in self.cur.fetchall():
+                self._make_order_card(row)
+        except Exception as e:
+            messagebox.showerror("БД", str(e))
+
+    def _make_order_card(self, data):
+        oid, odate, ddate, addr, client, code, status = data
+        frm = tk.Frame(self.order_frm, bg=COLORS["sec"], relief="solid",
+                       bd=1, padx=10, pady=10)
+        frm.pack(fill="x", padx=5, pady=5)
+
+        info = tk.Frame(frm, bg=COLORS["sec"])
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=f"Заказ №{oid}", font=("Times New Roman", 13, "bold"),
+                 bg=COLORS["sec"]).pack(anchor="w")
+        tk.Label(info, text=f"Клиент: {client}",
+                 font=("Times New Roman", 11), bg=COLORS["sec"]).pack(anchor="w")
+        tk.Label(info, text=f"Дата заказа: {odate} | Доставка: {ddate}",
+                 font=("Times New Roman", 11), bg=COLORS["sec"]).pack(anchor="w")
+        tk.Label(info, text=f"Пункт: {addr or 'Не указан'} | Код: {code} | Статус: {status}",
+                 font=("Times New Roman", 11), bg=COLORS["sec"]).pack(anchor="w")
+
+        # Кнопки только для администратора
+        if self.user["role"] == "Администратор":
+            btn_frm = tk.Frame(frm, bg=COLORS["sec"])
+            btn_frm.pack(side="right", padx=5)
+            tk.Button(btn_frm, text="ред.", bg=COLORS["acc"],
+                      command=lambda: self._open_order_form(oid)).pack(side="top", pady=2)
+            tk.Button(btn_frm, text="уд.", bg="#FF6B6B",
+                      command=lambda: self._delete_order(oid)).pack(side="top", pady=2)
+
+    def _delete_order(self, oid):
+        if messagebox.askyesno("Удаление", f"Удалить заказ №{oid}?"):
+            try:
+                self.cur.execute(
+                    f"SELECT COUNT(*) FROM {TABLES['comp']} WHERE orderid=%s", (oid,))
+                if self.cur.fetchone()[0] > 0:
+                    messagebox.showwarning("Запрет", "В заказе есть товары.")
+                    return
+                self.cur.execute(
+                    f"DELETE FROM {TABLES['orders']} WHERE orderid=%s", (oid,))
+                self.conn.commit()
+                self._load_orders()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("БД", str(e))
+
+    def _open_order_form(self, oid=None):
+        if self.order_edit_win is not None:
+            try:
+                if self.order_edit_win.winfo_exists():
+                    messagebox.showwarning("Окно", "Закройте открытое окно")
+                    return
+            except:
+                pass
+        self.order_edit_win = tk.Toplevel(self.root)
+        self.order_edit_win.title("Редактирование заказа" if oid else "Добавление заказа")
+        self.order_edit_win.geometry("400x450")
+        self.order_edit_win.configure(bg=COLORS["sec"])
+        self.order_edit_win.transient(self.root)
+        self.order_edit_win.grab_set()
+
+        fields = [
+            ("Клиент:", "client"),
+            ("Дата заказа:", "odate"),
+            ("Дата доставки:", "ddate"),
+            ("Код получения:", "code"),
+            ("Статус:", "status")
+        ]
+        ents = {}
+        for i, (lbl, key) in enumerate(fields):
+            tk.Label(self.order_edit_win, text=lbl, font=("Times New Roman", 12),
+                     bg=COLORS["sec"]).grid(row=i, column=0, sticky="w", padx=10, pady=5)
+            if key == "status":
+                ents[key] = ttk.Combobox(self.order_edit_win,
+                                         values=["Новый", "В обработке", "Завершен", "Отменен"],
+                                         font=("Times New Roman", 12), width=27)
+            else:
+                ents[key] = tk.Entry(self.order_edit_win, font=("Times New Roman", 12), width=30)
+            ents[key].grid(row=i, column=1, padx=10, pady=5, sticky="ew")
+
+        tk.Label(self.order_edit_win, text="Пункт выдачи:",
+                 font=("Times New Roman", 12), bg=COLORS["sec"]).grid(
+            row=len(fields), column=0, sticky="w", padx=10, pady=5)
+        pickup_cb = ttk.Combobox(self.order_edit_win, font=("Times New Roman", 12), width=27)
+        pickup_cb.grid(row=len(fields), column=1, padx=10, pady=5, sticky="ew")
+        try:
+            self.cur.execute(f"SELECT pointid, address FROM {TABLES['pickup']} ORDER BY pointid")
+            pickup_data = self.cur.fetchall()
+            pickup_options = [f"{p[0]} – {p[1]}" for p in pickup_data]
+            pickup_ids = [p[0] for p in pickup_data]
+        except:
+            pickup_options, pickup_ids = [], []
+        pickup_cb["values"] = pickup_options
+        ents["pickup"] = pickup_cb
+
+        if oid:
+            self.cur.execute(
+                f"SELECT clientfullname, orderdate, deliverydate, receivecode, "
+                f"orderstatus, pickuppointid FROM {TABLES['orders']} WHERE orderid=%s",
+                (oid,))
+            data = self.cur.fetchone()
+            for k, val in zip(["client", "odate", "ddate", "code", "status"], data[:5]):
+                if val is not None:
+                    ents[k].insert(0, str(val))
+            if data[5] is not None:
+                try:
+                    idx = pickup_ids.index(data[5])
+                    pickup_cb.current(idx)
+                except ValueError:
+                    pass
+
+        def save():
+            try:
+                v = {k: e.get().strip() for k, e in ents.items()}
+                if not v["client"]:
+                    raise ValueError("Введите клиента")
+                pickup_str = v["pickup"]
+                pickup_id = None
+                if pickup_str:
+                    pid_str = pickup_str.split("–")[0].strip()
+                    pickup_id = int(pid_str)
+                code_val = int(v["code"]) if v["code"] else None
+                if oid:
+                    self.cur.execute(
+                        f"UPDATE {TABLES['orders']} SET "
+                        f"clientfullname=%s, orderdate=%s, deliverydate=%s, "
+                        f"receivecode=%s, orderstatus=%s, pickuppointid=%s "
+                        f"WHERE orderid=%s",
+                        (v["client"], v["odate"], v["ddate"], code_val,
+                         v["status"], pickup_id, oid))
+                else:
+                    self.cur.execute(
+                        f"SELECT COALESCE(MAX(orderid), 0)+1 FROM {TABLES['orders']}")
+                    new_id = self.cur.fetchone()[0]
+                    self.cur.execute(
+                        f"INSERT INTO {TABLES['orders']} "
+                        f"(orderid, clientfullname, orderdate, deliverydate, "
+                        f"receivecode, orderstatus, pickuppointid) "
+                        f"VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (new_id, v["client"], v["odate"], v["ddate"],
+                         code_val, v["status"], pickup_id))
+                self.conn.commit()
+                self.order_edit_win.destroy()
+                self.order_edit_win = None
+                self._load_orders()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", str(e))
+
+        tk.Button(self.order_edit_win, text="Сохранить", bg=COLORS["acc"],
+                  command=save).grid(row=len(fields)+1, column=0, columnspan=2, pady=15)
+        self.order_edit_win.protocol("WM_DELETE_WINDOW", self._close_order_form)
+
+    def _close_order_form(self):
+        if self.order_edit_win and self.order_edit_win.winfo_exists():
+            self.order_edit_win.destroy()
+            self.order_edit_win = None
+
+    #ПУНКТЫ ВЫДАЧИ
+    def _show_pickup(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+
+        tk.Button(self.content, text="➕ Добавить пункт", bg=COLORS["acc"],
+                  command=self._open_pickup_form).pack(anchor="w", padx=5, pady=5)
+
+        canvas = tk.Canvas(self.content, bg=COLORS["bg"], highlightthickness=0)
+        scr = ttk.Scrollbar(self.content, orient="vertical", command=canvas.yview)
+        self.pickup_frm = tk.Frame(canvas, bg=COLORS["bg"])
+        self.pickup_frm.bind("<Configure>",
+                             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.pickup_frm, anchor="nw")
+        canvas.configure(yscrollcommand=scr.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+        self._load_pickup()
+
+    def _load_pickup(self):
+        for w in self.pickup_frm.winfo_children():
+            w.destroy()
+        try:
+            self.cur.execute(
+                f"SELECT pointid, address FROM {TABLES['pickup']} ORDER BY pointid")
+            for row in self.cur.fetchall():
+                self._make_pickup_card(row)
+        except Exception as e:
+            messagebox.showerror("БД", str(e))
+
+    def _make_pickup_card(self, data):
+        pid, addr = data
+        frm = tk.Frame(self.pickup_frm, bg=COLORS["sec"], relief="solid",
+                       bd=1, padx=10, pady=10)
+        frm.pack(fill="x", padx=5, pady=5)
+
+        info = tk.Frame(frm, bg=COLORS["sec"])
+        info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=f"Пункт №{pid}", font=("Times New Roman", 13, "bold"),
+                 bg=COLORS["sec"]).pack(anchor="w")
+        tk.Label(info, text=addr, font=("Times New Roman", 11),
+                 bg=COLORS["sec"]).pack(anchor="w")
+
+        btn_frm = tk.Frame(frm, bg=COLORS["sec"])
+        btn_frm.pack(side="right", padx=5)
+        tk.Button(btn_frm, text="ред.", bg=COLORS["acc"],
+                  command=lambda: self._open_pickup_form(pid)).pack(side="top", pady=2)
+        tk.Button(btn_frm, text="уд.", bg="#FF6B6B",
+                  command=lambda: self._delete_pickup(pid)).pack(side="top", pady=2)
+
+    def _delete_pickup(self, pid):
+        if messagebox.askyesno("Удаление", f"Удалить пункт №{pid}?"):
+            try:
+                self.cur.execute(
+                    f"SELECT COUNT(*) FROM {TABLES['orders']} WHERE pickuppointid=%s", (pid,))
+                if self.cur.fetchone()[0] > 0:
+                    messagebox.showwarning("Запрет", "Есть заказы с этим пунктом.")
+                    return
+                self.cur.execute(
+                    f"DELETE FROM {TABLES['pickup']} WHERE pointid=%s", (pid,))
+                self.conn.commit()
+                self._load_pickup()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("БД", str(e))
+
+    def _open_pickup_form(self, pid=None):
+        if self.pickup_edit_win is not None:
+            try:
+                if self.pickup_edit_win.winfo_exists():
+                    messagebox.showwarning("Окно", "Закройте открытое окно")
+                    return
+            except:
+                pass
+        self.pickup_edit_win = tk.Toplevel(self.root)
+        self.pickup_edit_win.title("Редактирование" if pid else "Добавление пункта")
+        self.pickup_edit_win.geometry("400x200")
+        self.pickup_edit_win.configure(bg=COLORS["sec"])
+        self.pickup_edit_win.transient(self.root)
+        self.pickup_edit_win.grab_set()
+        tk.Label(self.pickup_edit_win, text="Адрес:", font=("Times New Roman", 12),
+                 bg=COLORS["sec"]).pack(pady=10)
+        ent = tk.Entry(self.pickup_edit_win, font=("Times New Roman", 12), width=40)
+        ent.pack(pady=5)
+        if pid:
+            self.cur.execute(
+                f"SELECT address FROM {TABLES['pickup']} WHERE pointid=%s", (pid,))
+            ent.insert(0, self.cur.fetchone()[0])
+
+        def save():
+            try:
+                addr = ent.get().strip()
+                if not addr:
+                    raise ValueError("Введите адрес")
+                if pid:
+                    self.cur.execute(
+                        f"UPDATE {TABLES['pickup']} SET address=%s WHERE pointid=%s",
+                        (addr, pid))
+                else:
+                    self.cur.execute(
+                        f"INSERT INTO {TABLES['pickup']} (address) VALUES (%s)", (addr,))
+                self.conn.commit()
+                self.pickup_edit_win.destroy()
+                self.pickup_edit_win = None
+                self._load_pickup()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", str(e))
+
+        tk.Button(self.pickup_edit_win, text="Сохранить", bg=COLORS["acc"],
+                  command=save).pack(pady=15)
+        self.pickup_edit_win.protocol("WM_DELETE_WINDOW", self._close_pickup_form)
+
+    def _close_pickup_form(self):
+        if self.pickup_edit_win and self.pickup_edit_win.winfo_exists():
+            self.pickup_edit_win.destroy()
+            self.pickup_edit_win = None
+
+    #АНАЛИТИКА
+    def _show_analytics(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+        tk.Label(self.content, text="АНАЛИТИКА",
+                 font=("Times New Roman", 14, "bold"),
+                 bg=COLORS["bg"]).pack(pady=10)
+        queries = [
+            ("1. Всего велосипедов", f"SELECT COUNT(*) FROM {TABLES['bicycles']}", "шт."),
+            ("2. Общая стоимость склада",
+             f"SELECT ROUND(SUM(price * stockquantity), 2) FROM {TABLES['bicycles']}", "₽"),
+            ("3. Топ-3 поставщика",
+             f"SELECT supplier, COUNT(*) as cnt FROM {TABLES['bicycles']} "
+             f"GROUP BY supplier ORDER BY cnt DESC LIMIT 3", "")
+        ]
+        canvas = tk.Canvas(self.content, bg=COLORS["bg"], highlightthickness=0)
+        scr = ttk.Scrollbar(self.content, orient="vertical", command=canvas.yview)
+        card_frame = tk.Frame(canvas, bg=COLORS["bg"])
+        card_frame.bind("<Configure>",
+                        lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=card_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scr.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+        for title, q, unit in queries:
+            frm = tk.Frame(card_frame, bg=COLORS["sec"], relief="solid",
+                           bd=1, pady=10, padx=10)
+            frm.pack(fill="x", pady=5, padx=5)
+            tk.Label(frm, text=title, font=("Times New Roman", 12, "bold"),
+                     bg=COLORS["sec"]).pack(anchor="w", pady=(0, 5))
+            try:
+                self.cur.execute(q)
+                for row in self.cur.fetchall():
+                    tk.Label(frm, text=" | ".join(str(x) for x in row) +
+                             (f" {unit}" if unit else ""),
+                             font=("Times New Roman", 11),
+                             bg=COLORS["sec"]).pack(anchor="w", padx=5)
+            except:
+                tk.Label(frm, text="Ошибка запроса", bg=COLORS["sec"]).pack()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    BikeShopApp(root)
+    root.mainloop()

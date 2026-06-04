@@ -1,0 +1,734 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import psycopg2
+import os
+from PIL import Image, ImageTk
+
+# ==============================================================================
+# ИНСТРУКЦИЯ ПО НАСТРОЙКЕ ПОД СВОЮ БАЗУ ДАННЫХ
+# ==============================================================================
+#
+# ШАГ 1 — Подключение (DB_CONFIG ниже)
+#   Замените host, dbname, user, password, port на свои значения.
+#
+# ШАГ 2 — Схема (SCHEMA)
+#   Укажите название схемы. Если схемы нет — напишите "public".
+#
+# ШАГ 3 — Имена таблиц (словарь T)
+#   Ключи словаря (users, roles, bicycles, ...) НЕ ТРОГАТЬ —
+#   они используются по всему коду. Меняйте только значения справа.
+#   Пример: таблица товаров называется "products" -> "bicycles": "products"
+#
+# ШАГ 4 — Имена столбцов
+#   Ищите метки [COL: имя] по всему файлу — они стоят рядом с каждым
+#   местом где используется конкретный столбец. Меняйте имена в SQL-строках.
+#
+# ШАГ 5 — Роли (важно!)
+#   Приложение проверяет точные строки "Администратор", "Менеджер", "Гость".
+#   Если ваши роли называются иначе — ищите метки [ROLE] и меняйте.
+#
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# ШАГ 1: Подключение к базе данных — замените на свои значения
+# ------------------------------------------------------------------------------
+DB_CONFIG = {
+    "host":     "localhost",   # адрес сервера (или IP, например "192.168.1.10")
+    "dbname":   "postgres",    # имя базы данных
+    "user":     "postgres",    # пользователь PostgreSQL
+    "password": "1120",        # пароль
+    "port":     "5432"         # порт (по умолчанию 5432)
+}
+
+# ------------------------------------------------------------------------------
+# ШАГ 2: Схема базы данных
+# Если таблицы не в отдельной схеме — напишите "public"
+# ------------------------------------------------------------------------------
+SCHEMA = "prac"  # <- замените на имя вашей схемы
+
+# ------------------------------------------------------------------------------
+# ШАГ 3: Имена таблиц
+# Ключи словаря (users, roles, ...) — не менять.
+# Значения справа — имена таблиц в вашей БД, меняйте их.
+#
+#   "users"    -> таблица пользователей (логин, пароль, роль)
+#   "roles"    -> таблица ролей (id роли, название роли)
+#   "bicycles" -> таблица товаров
+#   "orders"   -> таблица заказов
+#   "comp"     -> состав заказов (какой товар в каком заказе)
+#   "pickup"   -> пункты выдачи заказов
+# ------------------------------------------------------------------------------
+T = {k: f"{SCHEMA}.{v}" for k, v in {
+    "users":    "users",             # <- имя таблицы пользователей
+    "roles":    "roles",             # <- имя таблицы ролей
+    "bicycles": "bicycles",          # <- имя таблицы товаров
+    "orders":   "orders",            # <- имя таблицы заказов
+    "comp":     "ordercomposition",  # <- имя таблицы состава заказов
+    "pickup":   "pickuppoints"       # <- имя таблицы пунктов выдачи
+}.items()}
+
+# Цвета интерфейса — менять по желанию
+C = {"bg": "#FFFFFF", "sec": "#7FFF00", "acc": "#00FA9A",
+     "disc": "#2E8B57", "nostock": "#87CEEB", "sel": "#FFD700"}
+
+
+def _f(size=11, bold=False):
+    return ("Times New Roman", size, "bold") if bold else ("Times New Roman", size)
+
+
+class BikeShopApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ВелоМагазин")
+        self.root.geometry("1100x750")
+        self.root.configure(bg=C["bg"])
+        self.conn = self.cur = None
+        self.user = {"name": "", "role": ""}
+        self.app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.edit_win = self.order_edit_win = self.pickup_edit_win = None
+        self.status_lbl = self.content = None
+        self._connect()
+        if self.conn:
+            self._show_login()
+
+    # ── Подключение к БД ───────────────────────────────────────────────────────
+    def _connect(self):
+        try:
+            self.conn = psycopg2.connect(**DB_CONFIG)
+            self.cur = self.conn.cursor()
+        except Exception as e:
+            messagebox.showerror("БД", f"Ошибка подключения: {e}")
+            self.root.destroy()
+
+    def _db(self, sql, params=(), commit=False):
+        """Выполняет SQL-запрос. Возвращает fetchall() или True при commit, None при ошибке."""
+        try:
+            self.cur.execute(sql, params)
+            if commit:
+                self.conn.commit()
+                return True
+            return self.cur.fetchall()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("БД", str(e))
+            return None
+
+    # ── UI-хелперы ────────────────────────────────────────────────────────────
+    def _clear(self, widget=None):
+        for w in (widget or self.content).winfo_children():
+            w.destroy()
+
+    def _scrollable(self, parent):
+        """Создаёт фрейм с вертикальной прокруткой."""
+        canvas = tk.Canvas(parent, bg=C["bg"], highlightthickness=0)
+        scr = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        frm = tk.Frame(canvas, bg=C["bg"])
+        frm.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=frm, anchor="nw")
+        canvas.configure(yscrollcommand=scr.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+        return frm
+
+    def _card(self, parent, bg=None):
+        bg = bg or C["sec"]
+        f = tk.Frame(parent, bg=bg, relief="solid", bd=1, padx=10, pady=10)
+        f.pack(fill="x", padx=5, pady=5)
+        return f
+
+    def _guard_win(self, attr):
+        """Возвращает False если вторичное окно уже открыто."""
+        w = getattr(self, attr)
+        if w:
+            try:
+                if w.winfo_exists():
+                    messagebox.showwarning("Окно", "Закройте открытое окно")
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _popup(self, attr, title, size="400x200"):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry(size)
+        win.configure(bg=C["sec"])
+        win.transient(self.root)
+        win.grab_set()
+        setattr(self, attr, win)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_win(attr))
+        return win
+
+    def _close_win(self, attr):
+        w = getattr(self, attr, None)
+        if w and w.winfo_exists():
+            w.destroy()
+        setattr(self, attr, None)
+
+    # ── Вход ──────────────────────────────────────────────────────────────────
+    def _show_login(self):
+        self._clear(self.root)
+        frm = tk.Frame(self.root, bg=C["sec"], padx=40, pady=30)
+        frm.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(frm, text="ВЕЛОМАГАЗИН — ВХОД", font=_f(16, True), bg=C["sec"]).pack(pady=10)
+        self.ent_l = self.ent_p = None
+        for label, show in [("Логин:", ""), ("Пароль:", "*")]:
+            tk.Label(frm, text=label, font=_f(12), bg=C["sec"]).pack(anchor="w")
+            ent = tk.Entry(frm, font=_f(12), width=25, show=show)
+            ent.pack(pady=5, fill="x")
+            if "Логин" in label:
+                self.ent_l = ent
+            else:
+                self.ent_p = ent
+        b = tk.Frame(frm, bg=C["sec"])
+        b.pack(fill="x", pady=15)
+        for txt, cmd in [
+            ("Войти", self._login),
+            # [ROLE] второй аргумент — название роли для гостевого входа (без пароля)
+            ("Гость", lambda: self._set_user("Гость", "Гость")),
+        ]:
+            tk.Button(b, text=txt, bg=C["acc"], command=cmd).pack(side="left", expand=True, padx=5)
+
+    def _login(self):
+        l, p = self.ent_l.get().strip(), self.ent_p.get().strip()
+        if not (l and p):
+            messagebox.showwarning("Ввод", "Заполните поля"); return
+        rows = self._db(
+            # ШАГ 4 — Столбцы таблиц users и roles:
+            # [COL: fullname]  — ФИО пользователя (таблица users)
+            # [COL: rolename]  — название роли (таблица roles)
+            # [COL: roleid]    — внешний ключ роли в users и первичный ключ в roles
+            # [COL: login]     — логин пользователя
+            # [COL: password]  — пароль пользователя
+            f"SELECT fullname, rolename FROM {T['users']} u "
+            f"JOIN {T['roles']} r ON u.roleid=r.roleid WHERE login=%s AND password=%s", (l, p))
+        if rows:
+            self._set_user(*rows[0])
+        elif rows is not None:
+            messagebox.showerror("Ошибка", "Неверный логин/пароль")
+
+    def _set_user(self, name, role):
+        self.user = {"name": name, "role": role}
+        self._show_main()
+
+    # ── Главное окно ──────────────────────────────────────────────────────────
+    def _show_main(self):
+        self._clear(self.root)
+        self.root.title(f"ВелоМагазин | {self.user['name']} ({self.user['role']})")
+        top = tk.Frame(self.root, bg=C["sec"], height=50)
+        top.pack(fill="x"); top.pack_propagate(False)
+        tk.Label(top, text="СИСТЕМА УПРАВЛЕНИЯ", font=_f(14, True), bg=C["sec"]).pack(side="left", padx=10)
+        self.status_lbl = tk.Label(top, text="Готов к работе", font=_f(11), bg=C["sec"])
+        self.status_lbl.pack(side="right", padx=10)
+        tk.Label(top, text=f"{self.user['name']} | {self.user['role']}",
+                 font=_f(12), bg=C["sec"]).pack(side="right", padx=10)
+        tk.Button(top, text="Выход", bg=C["acc"], command=self._show_login).pack(side="right", padx=10)
+
+        side = tk.Frame(self.root, bg=C["sec"], width=200)
+        side.pack(side="left", fill="y"); side.pack_propagate(False)
+        self.content = tk.Frame(self.root, bg=C["bg"])
+        self.content.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+
+        role = self.user["role"]
+        # ШАГ 5 / [ROLE] — Меню по ролям. Меняйте строки в кавычках если роли называются иначе.
+        buttons = [("Товары", self._show_products)]               # видят все
+        if role in ("Менеджер", "Администратор"):                 # [ROLE] Менеджер и Администратор
+            buttons.append(("Заказы", self._show_orders))
+        if role == "Администратор":                               # [ROLE] только Администратор
+            buttons += [("Пункты выдачи", self._show_pickup), ("Аналитика", self._show_analytics)]
+        for txt, cmd in buttons:
+            tk.Button(side, text=txt, font=_f(11), bg=C["acc"], pady=8,
+                      command=cmd).pack(fill="x", padx=5, pady=3)
+        self._show_products()
+
+    # ── Товары ────────────────────────────────────────────────────────────────
+    def _show_products(self):
+        self._clear()
+        role = self.user["role"]
+        # [ROLE] Панель поиска/фильтров — только для Менеджера и Администратора
+        if role in ("Менеджер", "Администратор"):
+            top = tk.Frame(self.content, bg=C["bg"])
+            top.pack(fill="x", pady=5)
+            sf = tk.Frame(top, bg=C["bg"]); sf.pack(side="left", padx=5)
+
+            tk.Label(sf, text="Поиск:", font=_f(11), bg=C["bg"]).pack(side="left")
+            self.search_ent = tk.Entry(sf, font=_f(11), width=20)
+            self.search_ent.pack(side="left", padx=5)
+            self.search_ent.bind("<KeyRelease>", lambda e: self._load_cards())
+
+            tk.Label(sf, text="Сорт:", font=_f(11), bg=C["bg"]).pack(side="left", padx=(10, 5))
+            self.sort_var = tk.StringVar(value="По умолчанию")
+            ttk.Combobox(sf, textvariable=self.sort_var, font=_f(11), width=12, state="readonly",
+                         values=["По умолчанию", "Остаток ↑", "Остаток ↓"]).pack(side="left", padx=5)
+            self.sort_var.trace_add("write", lambda *a: self._load_cards())
+
+            tk.Label(sf, text="Поставщик:", font=_f(11), bg=C["bg"]).pack(side="left", padx=(10, 5))
+            self.sup_var = tk.StringVar(value="Все поставщики")
+            sup_cb = ttk.Combobox(sf, textvariable=self.sup_var, font=_f(11), width=15)
+            sup_cb.pack(side="left", padx=5)
+            sup_cb.bind("<<ComboboxSelected>>", lambda e: self._load_cards())
+            rows = self._db(
+                # [COL: supplier] — фильтр поставщиков, таблица bicycles
+                f"SELECT DISTINCT supplier FROM {T['bicycles']} WHERE supplier IS NOT NULL ORDER BY supplier")
+            if rows:
+                sup_cb["values"] = ["Все поставщики"] + [r[0] for r in rows]
+                sup_cb.current(0)
+
+            # [ROLE] Кнопка добавления товара — только для Администратора
+            if role == "Администратор":
+                tk.Button(top, text="➕ Добавить велосипед", bg=C["acc"],
+                          command=self._open_product_form).pack(side="right", padx=5)
+
+        self.card_frm = self._scrollable(self.content)
+        self._load_cards()
+
+    def _load_cards(self):
+        self._clear(self.card_frm)
+        # Основной SELECT товаров.
+        # ВАЖНО: порядок столбцов здесь должен совпадать с распаковкой в _make_card() ниже.
+        # Если переименовали столбец — меняйте и в SELECT, и в строке распаковки.
+        # [COL: sku]             — артикул / первичный ключ
+        # [COL: productname]     — название товара
+        # [COL: category]        — категория
+        # [COL: description]     — описание
+        # [COL: manufacturer]    — производитель
+        # [COL: supplier]        — поставщик
+        # [COL: price]           — цена
+        # [COL: unit]            — единица измерения (шт., пара и т.д.)
+        # [COL: stockquantity]   — остаток на складе
+        # [COL: currentdiscount] — скидка в % (0–100)
+        # [COL: photo]           — путь к файлу фото
+        q = (f"SELECT sku, productname, category, description, manufacturer, "
+             f"supplier, price, unit, stockquantity, currentdiscount, photo FROM {T['bicycles']}")
+        params = []
+        if self.user["role"] in ("Менеджер", "Администратор"):
+            search, sup = self.search_ent.get().strip(), self.sup_var.get()
+            filters = []
+            if search:
+                # [COL: productname, category, manufacturer, supplier] — поля полнотекстового поиска
+                filters.append("(productname ILIKE %s OR category ILIKE %s OR manufacturer ILIKE %s OR supplier ILIKE %s)")
+                params += [f"%{search}%"] * 4
+            if sup != "Все поставщики":
+                # [COL: supplier] — фильтр по выбранному поставщику
+                filters.append("supplier = %s"); params.append(sup)
+            if filters:
+                q += " WHERE " + " AND ".join(filters)
+            sort = self.sort_var.get()
+            # [COL: stockquantity] — сортировка по остатку
+            if sort == "Остаток ↑": q += " ORDER BY stockquantity ASC"
+            elif sort == "Остаток ↓": q += " ORDER BY stockquantity DESC"
+        rows = self._db(q, params)
+        if rows is not None:
+            for row in rows:
+                self._make_card(row)
+
+    def _make_card(self, data):
+        # Распаковка строки из БД — порядок совпадает с SELECT в _load_cards()
+        # Если изменили набор столбцов в SELECT — обновите и эту строку
+        sku, name, cat, desc, manuf, sup, price, unit, stock, disc, photo = data
+        price, disc, stock = float(price or 0), int(disc or 0), int(stock or 0)
+        # Цвет фона карточки:
+        #   зелёный  — скидка > 15%  [COL: currentdiscount], порог можно изменить
+        #   голубой  — остаток = 0   [COL: stockquantity]
+        #   белый    — обычный товар
+        bg = C["disc"] if disc > 15 else C["nostock"] if stock == 0 else C["bg"]
+        frm = self._card(self.card_frm, bg)
+
+        # Блок с фото
+        img_frm = tk.Frame(frm, bg="white", width=120, height=120)
+        img_frm.pack(side="left", padx=5); img_frm.pack_propagate(False)
+        try:
+            path = os.path.join(self.app_dir, photo)
+            if not (photo and os.path.exists(path)): raise FileNotFoundError
+            img = Image.open(path).resize((110, 110), Image.Resampling.LANCZOS)
+            ph = ImageTk.PhotoImage(img)
+            lbl = tk.Label(img_frm, image=ph, bg="white"); lbl.pack(expand=True)
+            img_frm.image = ph
+        except Exception:
+            tk.Label(img_frm, text="Нет фото", font=_f(10), bg="white").pack(expand=True)
+
+        # Блок с информацией
+        info = tk.Frame(frm, bg=bg); info.pack(side="left", fill="both", expand=True, padx=10)
+        tk.Label(info, text=name, font=_f(13, True), bg=bg, anchor="w").pack(fill="x")
+        tk.Label(info, text=f"{cat} | {manuf} | {sup}", font=_f(11), bg=bg, anchor="w").pack(fill="x")
+        if desc:
+            tk.Label(info, text=desc, font=_f(10), bg=bg, wraplength=500, justify="left").pack(fill="x", pady=2)
+        pf = tk.Frame(info, bg=bg); pf.pack(fill="x", pady=5)
+        if disc > 0:
+            tk.Label(pf, text=f"{price:.0f}₽", font=_f(11, True), fg="red", bg=bg).pack(side="left", padx=5)
+            tk.Label(pf, text=f"{price*(1-disc/100):.0f}₽", font=_f(13, True), bg=bg).pack(side="left", padx=5)
+            tk.Label(pf, text=f"(-{disc}%)", font=_f(10), bg=bg).pack(side="left", padx=5)
+        else:
+            tk.Label(pf, text=f"{price:.0f}₽", font=_f(13, True), bg=bg).pack(side="left", padx=5)
+        tk.Label(info, text=f"Остаток: {stock} {unit}", font=_f(11), bg=bg).pack(anchor="w")
+
+        # [ROLE] Кнопки редактирования/удаления — только для Администратора
+        if self.user["role"] == "Администратор":
+            self._edit_delete_btns(frm, bg, lambda: self._open_product_form(sku),
+                                   lambda: self._delete_product(sku))
+
+    def _edit_delete_btns(self, parent, bg, edit_cmd, del_cmd):
+        bf = tk.Frame(parent, bg=bg); bf.pack(side="right", padx=5)
+        tk.Button(bf, text="ред.", bg=C["acc"], command=edit_cmd).pack(side="top", pady=2)
+        tk.Button(bf, text="уд.", bg="#FF6B6B", command=del_cmd).pack(side="top", pady=2)
+
+    def _delete_product(self, sku):
+        if not messagebox.askyesno("Удаление", f"Удалить велосипед {sku}?"): return
+        # Проверяем: товар не должен быть в составе заказов
+        # [COL: sku] — в таблице ordercomposition
+        rows = self._db(f"SELECT COUNT(*) FROM {T['comp']} WHERE sku=%s", (sku,))
+        if rows and rows[0][0] > 0:
+            messagebox.showwarning("Запрет", "Товар есть в заказе."); return
+        # [COL: sku] — первичный ключ таблицы bicycles
+        if self._db(f"DELETE FROM {T['bicycles']} WHERE sku=%s", (sku,), commit=True):
+            self._load_cards()
+
+    def _open_product_form(self, sku=None):
+        """Форма добавления / редактирования товара."""
+        if not self._guard_win("edit_win"): return
+        win = self._popup("edit_win", "Редактирование" if sku else "Добавление велосипеда", "400x520")
+
+        # Поля формы: (подпись на экране, внутренний ключ)
+        # Подписи меняйте свободно — они только для отображения.
+        # Внутренние ключи (name, cat, ...) используются при сохранении — не трогайте.
+        fields = [
+            ("Название:",      "name"),   # -> [COL: productname]
+            ("Категория:",     "cat"),    # -> [COL: category]
+            ("Описание:",      "desc"),   # -> [COL: description]
+            ("Производитель:", "manuf"),  # -> [COL: manufacturer]
+            ("Поставщик:",     "sup"),    # -> [COL: supplier]
+            ("Цена:",          "price"),  # -> [COL: price]
+            ("Остаток:",       "stock"),  # -> [COL: stockquantity]
+            ("Скидка %:",      "disc"),   # -> [COL: currentdiscount]
+            ("Фото:",          "photo"),  # -> [COL: photo]
+        ]
+        ents = {}
+        for i, (lbl, key) in enumerate(fields):
+            tk.Label(win, text=lbl, font=_f(12), bg=C["sec"]).grid(row=i, column=0, sticky="w", padx=10, pady=5)
+            ents[key] = tk.Entry(win, font=_f(12), width=30)
+            ents[key].grid(row=i, column=1, padx=10, pady=5, sticky="ew")
+            if key == "photo":
+                tk.Button(win, text="файл", bg=C["acc"],
+                          command=lambda e=ents["photo"]: e.insert(0,
+                              filedialog.askopenfilename(filetypes=[("Img", "*.png *.jpg")]))
+                          ).grid(row=i, column=2, padx=5)
+
+        if sku:
+            # Загрузка данных для редактирования.
+            # ВАЖНО: порядок столбцов в SELECT должен совпадать с порядком ключей в zip() ниже.
+            # [COL: productname, category, description, manufacturer, supplier,
+            #        price, stockquantity, currentdiscount, photo, sku]
+            rows = self._db(
+                f"SELECT productname, category, description, manufacturer, supplier, "
+                f"price, stockquantity, currentdiscount, photo FROM {T['bicycles']} WHERE sku=%s", (sku,))
+            if rows:
+                # Порядок ключей совпадает с порядком SELECT выше — не перемешивайте
+                for k, val in zip(["name", "cat", "desc", "manuf", "sup",
+                                   "price", "stock", "disc", "photo"], rows[0]):
+                    if val is not None: ents[k].insert(0, str(val))
+
+        def save():
+            try:
+                v = {k: e.get().strip() for k, e in ents.items()}
+                if not v["name"]: raise ValueError("Название обязательно")
+                price_val = float(v["price"] or 0)
+                stock_val = int(v["stock"] or 0)
+                disc_val  = int(v["disc"] or 0)
+                if price_val < 0 or stock_val < 0: raise ValueError("Цена и остаток >= 0")
+                if not (0 <= disc_val <= 100): raise ValueError("Скидка от 0 до 100")
+
+                # Обработка фото — сохраняем копию в папку рядом со скриптом
+                photo_path = None
+                if v["photo"] and os.path.exists(v["photo"]):
+                    img = Image.open(v["photo"]).convert("RGB").resize((300, 200), Image.Resampling.LANCZOS)
+                    fname = f"{sku or 'new'}_{os.path.basename(v['photo'])}"
+                    img.save(os.path.join(self.app_dir, fname))
+                    if sku:
+                        # Удаляем старый файл при замене фото
+                        # [COL: photo, sku]
+                        old = self._db(f"SELECT photo FROM {T['bicycles']} WHERE sku=%s", (sku,))
+                        if old and old[0][0]:
+                            op = os.path.join(self.app_dir, old[0][0])
+                            if os.path.exists(op): os.remove(op)
+                    photo_path = fname
+
+                if sku:
+                    # UPDATE существующего товара
+                    # [COL: productname, category, description, manufacturer, supplier,
+                    #        price, stockquantity, currentdiscount, photo, sku]
+                    cols = ("productname=%s, category=%s, description=%s, manufacturer=%s, "
+                            "supplier=%s, price=%s, stockquantity=%s, currentdiscount=%s")
+                    vals = [v["name"], v["cat"], v["desc"], v["manuf"],
+                            v["sup"], price_val, stock_val, disc_val]
+                    if photo_path is not None:
+                        # Фото изменилось — добавляем в UPDATE
+                        # Если photo_path is None — старое фото в БД остаётся без изменений
+                        cols += ", photo=%s"; vals.append(photo_path)
+                    self._db(f"UPDATE {T['bicycles']} SET {cols} WHERE sku=%s", vals + [sku], commit=True)
+                else:
+                    # INSERT нового товара — автогенерация артикула
+                    # [COL: sku] — если sku не числовой, замените эту логику на свою
+                    rows = self._db(f"SELECT COALESCE(MAX(CAST(sku AS INT)), 0)+1 FROM {T['bicycles']}")
+                    new_sku = str(rows[0][0]).zfill(3)
+                    # [COL: sku, productname, category, description, manufacturer,
+                    #        supplier, price, stockquantity, currentdiscount, photo]
+                    self._db(
+                        f"INSERT INTO {T['bicycles']} "
+                        f"(sku, productname, category, description, manufacturer, "
+                        f"supplier, price, stockquantity, currentdiscount, photo) "
+                        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        (new_sku, v["name"], v["cat"], v["desc"], v["manuf"],
+                         v["sup"], price_val, stock_val, disc_val, photo_path), commit=True)
+                self._close_win("edit_win"); self._load_cards()
+            except Exception as e:
+                self.conn.rollback(); messagebox.showerror("Ошибка", str(e))
+
+        tk.Button(win, text="Сохранить", bg=C["acc"], command=save).grid(
+            row=len(fields), column=0, columnspan=3, pady=15)
+
+    # ── Заказы ────────────────────────────────────────────────────────────────
+    def _show_orders(self):
+        self._clear()
+        # [ROLE] Кнопка добавления заказа — только для Администратора
+        if self.user["role"] == "Администратор":
+            tk.Button(self.content, text="+ Добавить заказ", bg=C["acc"],
+                      command=self._open_order_form).pack(anchor="w", padx=5, pady=5)
+        self.order_frm = self._scrollable(self.content)
+        self._load_orders()
+
+    def _load_orders(self):
+        self._clear(self.order_frm)
+        # Загрузка заказов с JOIN к таблице пунктов выдачи.
+        # [COL: orderid]        — номер заказа (таблица orders)
+        # [COL: orderdate]      — дата оформления
+        # [COL: deliverydate]   — дата доставки
+        # [COL: address]        — адрес пункта (таблица pickuppoints)
+        # [COL: clientfullname] — ФИО клиента
+        # [COL: receivecode]    — код получения
+        # [COL: orderstatus]    — статус заказа
+        # [COL: pickuppointid]  — внешний ключ orders -> pickuppoints
+        # [COL: pointid]        — первичный ключ таблицы pickuppoints
+        rows = self._db(
+            f"SELECT o.orderid, o.orderdate, o.deliverydate, p.address, "
+            f"o.clientfullname, o.receivecode, o.orderstatus "
+            f"FROM {T['orders']} o LEFT JOIN {T['pickup']} p ON o.pickuppointid=p.pointid "
+            f"ORDER BY o.orderdate DESC")
+        if rows is not None:
+            for row in rows: self._make_order_card(row)
+
+    def _make_order_card(self, data):
+        # Распаковка — порядок совпадает с SELECT в _load_orders()
+        oid, odate, ddate, addr, client, code, status = data
+        frm = self._card(self.order_frm)
+        info = tk.Frame(frm, bg=C["sec"]); info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=f"Заказ #{oid}", font=_f(13, True), bg=C["sec"]).pack(anchor="w")
+        for txt in [f"Клиент: {client}",
+                    f"Дата заказа: {odate} | Доставка: {ddate}",
+                    f"Пункт: {addr or 'Не указан'} | Код: {code} | Статус: {status}"]:
+            tk.Label(info, text=txt, font=_f(11), bg=C["sec"]).pack(anchor="w")
+        # [ROLE] Кнопки ред./уд. — только для Администратора
+        if self.user["role"] == "Администратор":
+            self._edit_delete_btns(frm, C["sec"], lambda: self._open_order_form(oid),
+                                   lambda: self._delete_order(oid))
+
+    def _delete_order(self, oid):
+        if not messagebox.askyesno("Удаление", f"Удалить заказ #{oid}?"): return
+        # Проверяем: в заказе не должно быть товаров
+        # [COL: orderid] — в таблице ordercomposition
+        rows = self._db(f"SELECT COUNT(*) FROM {T['comp']} WHERE orderid=%s", (oid,))
+        if rows and rows[0][0] > 0:
+            messagebox.showwarning("Запрет", "В заказе есть товары."); return
+        # [COL: orderid] — первичный ключ таблицы orders
+        if self._db(f"DELETE FROM {T['orders']} WHERE orderid=%s", (oid,), commit=True):
+            self._load_orders()
+
+    def _open_order_form(self, oid=None):
+        """Форма добавления / редактирования заказа."""
+        if not self._guard_win("order_edit_win"): return
+        win = self._popup("order_edit_win",
+                          "Редактирование заказа" if oid else "Добавление заказа", "400x450")
+
+        # Поля формы заказа
+        fields = [
+            ("Клиент:",        "client"),  # -> [COL: clientfullname]
+            ("Дата заказа:",   "odate"),   # -> [COL: orderdate]
+            ("Дата доставки:", "ddate"),   # -> [COL: deliverydate]
+            ("Код получения:", "code"),    # -> [COL: receivecode]
+            ("Статус:",        "status"),  # -> [COL: orderstatus]
+        ]
+        ents = {}
+        for i, (lbl, key) in enumerate(fields):
+            tk.Label(win, text=lbl, font=_f(12), bg=C["sec"]).grid(row=i, column=0, sticky="w", padx=10, pady=5)
+            if key == "status":
+                # Допустимые статусы — измените под свои значения в БД
+                ents[key] = ttk.Combobox(win, font=_f(12), width=27,
+                                         values=["Новый", "В обработке", "Завершен", "Отменен"])
+            else:
+                ents[key] = tk.Entry(win, font=_f(12), width=30)
+            ents[key].grid(row=i, column=1, padx=10, pady=5, sticky="ew")
+
+        # Выпадающий список пунктов выдачи
+        tk.Label(win, text="Пункт выдачи:", font=_f(12), bg=C["sec"]).grid(
+            row=len(fields), column=0, sticky="w", padx=10, pady=5)
+        pickup_cb = ttk.Combobox(win, font=_f(12), width=27)
+        pickup_cb.grid(row=len(fields), column=1, padx=10, pady=5, sticky="ew")
+        # [COL: pointid, address] — загрузка пунктов выдачи для списка
+        pd_rows = self._db(f"SELECT pointid, address FROM {T['pickup']} ORDER BY pointid") or []
+        pickup_ids = [p[0] for p in pd_rows]
+        # Формат: "1 – Адрес". Разделитель " – " используется при разборе в save() ниже
+        pickup_cb["values"] = [f"{p[0]} \u2013 {p[1]}" for p in pd_rows]
+        ents["pickup"] = pickup_cb
+
+        if oid:
+            # Заполняем форму при редактировании
+            # [COL: clientfullname, orderdate, deliverydate, receivecode, orderstatus, pickuppointid]
+            data = (self._db(
+                f"SELECT clientfullname, orderdate, deliverydate, receivecode, "
+                f"orderstatus, pickuppointid FROM {T['orders']} WHERE orderid=%s", (oid,)) or [None])[0]
+            if data:
+                for k, val in zip(["client", "odate", "ddate", "code", "status"], data[:5]):
+                    if val is not None: ents[k].insert(0, str(val))
+                if data[5] is not None:
+                    try: pickup_cb.current(pickup_ids.index(data[5]))
+                    except ValueError: pass
+
+        def save():
+            try:
+                v = {k: e.get().strip() for k, e in ents.items()}
+                if not v["client"]: raise ValueError("Введите клиента")
+                # Достаём pointid из строки "1 – Адрес"
+                # Если поменяли разделитель в pickup_cb["values"] — меняйте и здесь
+                pid      = int(v["pickup"].split("\u2013")[0].strip()) if v["pickup"] else None
+                code_val = int(v["code"]) if v["code"] else None
+                if oid:
+                    # UPDATE существующего заказа
+                    # [COL: clientfullname, orderdate, deliverydate, receivecode,
+                    #        orderstatus, pickuppointid, orderid]
+                    self._db(
+                        f"UPDATE {T['orders']} SET clientfullname=%s, orderdate=%s, "
+                        f"deliverydate=%s, receivecode=%s, orderstatus=%s, pickuppointid=%s "
+                        f"WHERE orderid=%s",
+                        (v["client"], v["odate"], v["ddate"], code_val, v["status"], pid, oid),
+                        commit=True)
+                else:
+                    # INSERT нового заказа — автогенерация ID
+                    # Если ID генерируется через SERIAL — уберите эту строку
+                    # и удалите orderid из INSERT и VALUES ниже
+                    new_id = (self._db(f"SELECT COALESCE(MAX(orderid),0)+1 FROM {T['orders']}") or [(1,)])[0][0]
+                    # [COL: orderid, clientfullname, orderdate, deliverydate,
+                    #        receivecode, orderstatus, pickuppointid]
+                    self._db(
+                        f"INSERT INTO {T['orders']} "
+                        f"(orderid, clientfullname, orderdate, deliverydate, "
+                        f"receivecode, orderstatus, pickuppointid) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (new_id, v["client"], v["odate"], v["ddate"], code_val, v["status"], pid),
+                        commit=True)
+                self._close_win("order_edit_win"); self._load_orders()
+            except Exception as e:
+                self.conn.rollback(); messagebox.showerror("Ошибка", str(e))
+
+        tk.Button(win, text="Сохранить", bg=C["acc"], command=save).grid(
+            row=len(fields)+1, column=0, columnspan=2, pady=15)
+
+    # ── Пункты выдачи ─────────────────────────────────────────────────────────
+    def _show_pickup(self):
+        self._clear()
+        tk.Button(self.content, text="+ Добавить пункт", bg=C["acc"],
+                  command=self._open_pickup_form).pack(anchor="w", padx=5, pady=5)
+        self.pickup_frm = self._scrollable(self.content)
+        self._load_pickup()
+
+    def _load_pickup(self):
+        self._clear(self.pickup_frm)
+        # [COL: pointid, address] — загрузка всех пунктов выдачи
+        rows = self._db(f"SELECT pointid, address FROM {T['pickup']} ORDER BY pointid")
+        if rows is not None:
+            for row in rows: self._make_pickup_card(row)
+
+    def _make_pickup_card(self, data):
+        # Распаковка — порядок совпадает с SELECT в _load_pickup()
+        pid, addr = data   # [COL: pointid, address]
+        frm = self._card(self.pickup_frm)
+        info = tk.Frame(frm, bg=C["sec"]); info.pack(side="left", fill="both", expand=True)
+        tk.Label(info, text=f"Пункт #{pid}", font=_f(13, True), bg=C["sec"]).pack(anchor="w")
+        tk.Label(info, text=addr, font=_f(11), bg=C["sec"]).pack(anchor="w")
+        self._edit_delete_btns(frm, C["sec"], lambda: self._open_pickup_form(pid),
+                               lambda: self._delete_pickup(pid))
+
+    def _delete_pickup(self, pid):
+        if not messagebox.askyesno("Удаление", f"Удалить пункт #{pid}?"): return
+        # Проверяем: нет ли заказов с этим пунктом
+        # [COL: pickuppointid] — внешний ключ в таблице orders
+        rows = self._db(f"SELECT COUNT(*) FROM {T['orders']} WHERE pickuppointid=%s", (pid,))
+        if rows and rows[0][0] > 0:
+            messagebox.showwarning("Запрет", "Есть заказы с этим пунктом."); return
+        # [COL: pointid] — первичный ключ таблицы pickuppoints
+        if self._db(f"DELETE FROM {T['pickup']} WHERE pointid=%s", (pid,), commit=True):
+            self._load_pickup()
+
+    def _open_pickup_form(self, pid=None):
+        """Форма добавления / редактирования пункта выдачи."""
+        if not self._guard_win("pickup_edit_win"): return
+        win = self._popup("pickup_edit_win", "Редактирование" if pid else "Добавление пункта")
+        tk.Label(win, text="Адрес:", font=_f(12), bg=C["sec"]).pack(pady=10)
+        ent = tk.Entry(win, font=_f(12), width=40); ent.pack(pady=5)
+        if pid:
+            # [COL: address, pointid] — загрузка текущего адреса
+            rows = self._db(f"SELECT address FROM {T['pickup']} WHERE pointid=%s", (pid,))
+            if rows: ent.insert(0, rows[0][0])
+
+        def save():
+            addr = ent.get().strip()
+            if not addr: messagebox.showerror("Ошибка", "Введите адрес"); return
+            ok = (
+                # [COL: address, pointid] — обновление
+                self._db(f"UPDATE {T['pickup']} SET address=%s WHERE pointid=%s",
+                         (addr, pid), commit=True)
+                if pid else
+                # [COL: address] — вставка нового пункта
+                self._db(f"INSERT INTO {T['pickup']} (address) VALUES (%s)",
+                         (addr,), commit=True)
+            )
+            if ok: self._close_win("pickup_edit_win"); self._load_pickup()
+
+        tk.Button(win, text="Сохранить", bg=C["acc"], command=save).pack(pady=15)
+
+    # ── Аналитика ─────────────────────────────────────────────────────────────
+    def _show_analytics(self):
+        self._clear()
+        tk.Label(self.content, text="АНАЛИТИКА", font=_f(14, True), bg=C["bg"]).pack(pady=10)
+        # Аналитические запросы — добавляйте и меняйте по своему усмотрению.
+        # Формат: (заголовок, SQL-запрос, единица измерения)
+        queries = [
+            # [COL: —] COUNT не требует конкретных столбцов
+            ("1. Всего товаров",
+             f"SELECT COUNT(*) FROM {T['bicycles']}", "шт."),
+
+            # [COL: price, stockquantity] — стоимость склада
+            ("2. Общая стоимость склада",
+             f"SELECT ROUND(SUM(price*stockquantity),2) FROM {T['bicycles']}", "\u20bd"),
+
+            # [COL: supplier] — топ поставщиков
+            ("3. Топ-3 поставщика",
+             f"SELECT supplier, COUNT(*) cnt FROM {T['bicycles']} "
+             f"GROUP BY supplier ORDER BY cnt DESC LIMIT 3", ""),
+        ]
+        cf = self._scrollable(self.content)
+        for title, q, unit in queries:
+            frm = self._card(cf)
+            tk.Label(frm, text=title, font=_f(12, True), bg=C["sec"]).pack(anchor="w", pady=(0, 5))
+            rows = self._db(q)
+            if rows:
+                for row in rows:
+                    tk.Label(frm,
+                             text=" | ".join(str(x) for x in row) + (f" {unit}" if unit else ""),
+                             font=_f(11), bg=C["sec"]).pack(anchor="w", padx=5)
+            else:
+                tk.Label(frm, text="Ошибка запроса", bg=C["sec"]).pack()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    BikeShopApp(root)
+    root.mainloop()
